@@ -558,6 +558,144 @@ def test_builtin_strict_verifier_agrees_with_reference(client):
             assert bad is False
 
 
+def test_strict_verifier_rejects_malformed_inputs_without_raising(client):
+    """非法摘要 / 非对象步骤 / 缺键多键 / 缺步多步等一律返回 False，绝不抛异常。"""
+    snap = build_mixed(client)
+    sid = snap["snapshot_id"]
+    root = merkle_root(client, sid).json()["root"]
+    p = merkle_root(client, sid, params={"seq": 1}).json()
+    good_kwargs = dict(
+        leaf_hash=p["leaf_hash"],
+        index=p["leaf_index"],
+        leaf_count=5,
+        path=p["proof"]["path"],
+        root_hex=root,
+    )
+    assert app_merkle.verify_inclusion_proof(**good_kwargs) is True
+
+    def rejected(**overrides):
+        kwargs = dict(good_kwargs)
+        kwargs.update(overrides)
+        # 关键契约：任何畸形输入都不得向外泄漏解析异常
+        assert app_merkle.verify_inclusion_proof(**kwargs) is False
+
+    valid_sibling = good_kwargs["path"][0]["hash"]
+    other_sibling = good_kwargs["path"][1]["hash"]
+
+    # ---- 摘要格式错误（叶子 / 根 / 兄弟摘要）----
+    rejected(leaf_hash="not-hex")
+    rejected(leaf_hash="0" * 63)          # 长度不足
+    rejected(leaf_hash="0" * 65)          # 长度过长
+    rejected(leaf_hash="g" * 64)          # 非十六进制字符
+    rejected(leaf_hash="A" * 64)          # 大写不接受（方案规定小写）
+    rejected(leaf_hash=" " + "0" * 63)    # 空白不接受（bytes.fromhex 会宽容）
+    rejected(leaf_hash=None)
+    rejected(leaf_hash=123)
+    rejected(root_hex="xyz")
+    rejected(root_hex="0" * 63)
+    rejected(root_hex="F" * 64)
+    rejected(root_hex=None)
+    bad = [dict(step) for step in good_kwargs["path"]]
+    bad[0]["hash"] = "zz"
+    rejected(path=bad)
+    bad = [dict(step) for step in good_kwargs["path"]]
+    bad[1]["hash"] = other_sibling[:-1] + "G"   # 非法字符
+    rejected(path=bad)
+    bad = [dict(step) for step in good_kwargs["path"]]
+    bad[0]["hash"] = valid_sibling.upper()      # 大写摘要 -> 无效
+    rejected(path=bad)
+    bad = [dict(step) for step in good_kwargs["path"]]
+    bad[0]["hash"] = 123                        # 非字符串
+    rejected(path=bad)
+
+    # ---- 路径步骤结构错误（非对象 / 缺键 / 多键 / 字段类型错误）----
+    rejected(path=[None, good_kwargs["path"][1]])
+    rejected(path=["raw-hash", good_kwargs["path"][1]])
+    rejected(path=[123, good_kwargs["path"][1]])
+    rejected(path=[["x"], good_kwargs["path"][1]])
+    step = dict(good_kwargs["path"][0])
+    for missing in ("level", "side", "hash", "duplicated"):
+        incomplete = {k: v for k, v in step.items() if k != missing}
+        rejected(path=[incomplete, good_kwargs["path"][1]])
+    extra = dict(step)
+    extra["unexpected"] = 1
+    rejected(path=[extra, good_kwargs["path"][1]])
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["duplicated"] = 0          # 真值等同 False 但不是 bool -> 结构错误
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["duplicated"] = "false"
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["duplicated"] = None
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["side"] = 0
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["side"] = None
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["level"] = "0"
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["level"] = 1               # 层号与推导位置不符
+    rejected(path=bad)
+    bad = [dict(s) for s in good_kwargs["path"]]
+    bad[0]["level"] = -1
+    rejected(path=bad)
+
+    # ---- 路径缺步 / 多步 ----
+    rejected(path=good_kwargs["path"][:-1])     # 缺步：折不到根
+    rejected(path=[])                           # 5 叶树空路径
+    rejected(path=good_kwargs["path"] + [dict(good_kwargs["path"][-1])])  # 多步
+    # 单叶树合法路径为空；给出任何步骤都属多步
+    submit(client, "solo-ch", 1, 1, "solo")
+    solo = make_snapshot(client, "solo-ch", "k")
+    solo_proof = merkle_root(client, solo["snapshot_id"], params={"seq": 1}).json()
+    rejected(
+        leaf_hash=solo_proof["leaf_hash"],
+        index=0,
+        leaf_count=1,
+        path=[
+            {
+                "level": 0,
+                "side": "right",
+                "hash": solo_proof["leaf_hash"],
+                "duplicated": True,
+            }
+        ],
+        root_hex=solo_proof["proof"]["root"],
+    )
+    # 单叶树空路径 + 根即叶摘要 -> 通过
+    assert app_merkle.verify_inclusion_proof(
+        leaf_hash=solo_proof["leaf_hash"],
+        index=0,
+        leaf_count=1,
+        path=[],
+        root_hex=solo_proof["proof"]["root"],
+    ) is True
+
+    # ---- path / index / leaf_count 类型错误 ----
+    rejected(path=None)
+    # tuple 形态的等价路径仍可正常验证（JSON 数组的 Python 形态本就是 list）
+    assert app_merkle.verify_inclusion_proof(
+        **{**good_kwargs, "path": tuple(good_kwargs["path"])}
+    ) is True
+    rejected(leaf_count=5.0)
+    rejected(leaf_count="5")
+    rejected(leaf_count=True)
+    rejected(leaf_count=None)
+    rejected(index=0.0)
+    rejected(index="0")
+    rejected(index=True)
+    # 取值非法
+    rejected(leaf_count=0)
+    rejected(leaf_count=-1)
+    rejected(index=-1)
+    rejected(index=5)
+
+
 # ---------- 冻结性：快照后变化不改变旧根 ----------
 
 

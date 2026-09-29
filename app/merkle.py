@@ -224,6 +224,33 @@ def inclusion_proof(leaf_hashes: list, index: int) -> list:
     return path
 
 
+#: SHA-256 摘要的十六进制长度（32 字节）
+_DIGEST_HEX_LEN = 64
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+#: 包含证明每一步必须且仅能包含的键（缺键 / 多键均视为结构错误）
+_PROOF_STEP_KEYS = frozenset(("level", "side", "hash", "duplicated"))
+
+
+def _is_plain_int(value) -> bool:
+    """判定是否为非布尔整数（bool 虽是 int 子类，但语义上不是序号 / 计数）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_sha256_hex(value) -> bool:
+    """严格判定是否为本方案规定的 SHA-256 摘要：恰好 64 位小写十六进制。
+
+    不使用 ``bytes.fromhex`` 判定——它接受空白分隔与大写，且对非法字符
+    / 奇数长度直接抛 ValueError；验签入口对格式错误只能返回 False。
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == _DIGEST_HEX_LEN
+        and all(ch in _HEX_DIGITS for ch in value)
+    )
+
+
 def verify_inclusion_proof(
     *,
     leaf_hash: str,
@@ -237,20 +264,47 @@ def verify_inclusion_proof(
     供离线验真参考实现——不信任路径自报的 side / duplicated，只信兄弟
     摘要；任何一步不一致或最终摘要不等于树根都返回 False。单叶树
     （leaf_count=1）的路径为空，树根应恰为叶子摘要。
+
+    对任何格式 / 结构不合法的输入（摘要不是 64 位小写十六进制、路径
+    步骤不是对象或缺 / 多键、路径缺步或多步、序号 / 叶总数类型错误等）
+    一律返回 False，绝不向调用方泄漏 ``bytes.fromhex`` 等解析异常——
+    调用方只需按布尔结论区分有效 / 无效证明。
     """
+    # 入参结构与格式校验：不合法即按无效证明处理，避免后续解析抛异常
+    if not _is_plain_int(leaf_count) or not _is_plain_int(index):
+        return False
     if leaf_count < 1 or not 0 <= index < leaf_count:
         return False
+    if not isinstance(path, (list, tuple)):
+        return False
+    if not _is_sha256_hex(leaf_hash) or not _is_sha256_hex(root_hex):
+        return False
+
     level_len = leaf_count
     idx = index
     current = leaf_hash
-    for step in path:
+    for expected_level, step in enumerate(path):
         if level_len == 1:
-            # 已经到达唯一的根节点，路径不应再给出兄弟
+            # 多步：已经到达唯一的根节点，路径不应再给出兄弟
             return False
-        side = step.get("side")
-        sibling = step.get("hash")
-        duplicated = bool(step.get("duplicated"))
-        if not isinstance(sibling, str):
+        if not isinstance(step, dict):
+            # 路径步骤必须是对象（非对象步骤无法安全取键，直接判无效）
+            return False
+        if set(step) != _PROOF_STEP_KEYS:
+            # 缺键 / 多键均属结构错误
+            return False
+        level = step["level"]
+        side = step["side"]
+        sibling = step["hash"]
+        duplicated = step["duplicated"]
+        if not _is_plain_int(level) or level < 0 or level != expected_level:
+            return False
+        if not isinstance(side, str):
+            return False
+        if not _is_sha256_hex(sibling):
+            # 非法十六进制兄弟摘要 -> 验证失败，而非抛 ValueError
+            return False
+        if not isinstance(duplicated, bool):
             return False
         # 复制只可能发生在：index 为偶数、且它就是本层最后一个节点
         expect_duplicated = idx % 2 == 0 and idx + 1 >= level_len
@@ -269,7 +323,9 @@ def verify_inclusion_proof(
             if side != "left":
                 return False
             left, right = sibling, current
+        # 三个摘要均已通过 _is_sha256_hex 校验，fromhex 不会再抛异常
         current = hash_node(left, right)
         level_len = (level_len + 1) // 2
         idx //= 2
+    # 缺步（循环结束仍未折到唯一根）/ idx 未归 0 / 根不符都在此判失败
     return level_len == 1 and idx == 0 and current == root_hex
